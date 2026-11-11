@@ -508,6 +508,7 @@ test("nested folders, global search, moves, and subtree deletion", async ({
   await navigation.getByRole("link", { name: "Research", exact: true }).click();
   await newNote(page, "Nested discovery", "Searchable astronomy thought");
   await page.locator(".back-link").click();
+  await expect(page).toHaveURL(/\/notes\?folder=/);
   await page.getByLabel("Search your notes", { exact: true }).fill("astronomy");
   await expect(page.locator(".tree-note")).toHaveCount(1);
   await expect(page).toHaveURL(/q=astronomy/);

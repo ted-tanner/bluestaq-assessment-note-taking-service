@@ -2,7 +2,7 @@
   import { autosize } from "#lib/autosize.js";
   import { modal } from "#lib/modal.js";
   import { onMount, tick } from "svelte";
-  import { goto, beforeNavigate, afterNavigate } from "$app/navigation";
+  import { goto, beforeNavigate } from "$app/navigation";
   import { page, navigating } from "$app/state";
   import {
     api,
@@ -110,21 +110,13 @@
   function folderHref(id: string) {
     return contextHref("/notes", id);
   }
-  let pendingNavigationHref: string | undefined;
   function updateQuery(value: string) {
-    if (page.url.port === "15200") console.debug("qa-search input", value, page.url.pathname, pendingNavigationHref);
     query = value;
-    const url = new URL(pendingNavigationHref ?? page.url.href);
+    const url = new URL((page.shallow?.url ?? page.url).href);
     if (query) url.searchParams.set("q", query);
     else url.searchParams.delete("q");
-    // This route has no load functions. A normal router update keeps the URL,
-    // history, and page state together without remounting the current draft.
-    void goto(url, { replace: true, reset: false });
+    void goto(url, { shallow: true, replace: true, reset: false });
   }
-  afterNavigate((nav) => {
-    if (page.url.port === "15200") console.debug("qa-search after", nav.shallow, page.url.href, query);
-    pendingNavigationHref = undefined;
-  });
   $effect(() => {
     query = (page.shallow?.url ?? page.url).searchParams.get("q") ?? "";
   });
@@ -417,8 +409,6 @@
     }
   }
   beforeNavigate((nav) => {
-    if (page.url.port === "15200") console.debug("qa-search before", nav.shallow, nav.to?.url.href, query);
-    if (!nav.shallow) pendingNavigationHref = nav.to?.url.href;
     if (bypass || !draft?.dirty) return;
     if (!nav.willUnload && nav.to?.url.pathname === page.url.pathname) return;
     if (nav.willUnload) {
