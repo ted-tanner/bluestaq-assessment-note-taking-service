@@ -11,12 +11,16 @@ pub struct User {
     pub token_version: i64,
     pub verified: bool,
     pub created_at: i64,
+    pub name: String,
+    pub name_key: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Queryable, Selectable)]
+#[diesel(table_name = users)]
 pub struct UserInfo {
     pub id: String,
     pub email: String,
+    pub name: String,
 }
 
 impl From<User> for UserInfo {
@@ -24,6 +28,7 @@ impl From<User> for UserInfo {
         Self {
             id: user.id,
             email: user.email,
+            name: user.name,
         }
     }
 }

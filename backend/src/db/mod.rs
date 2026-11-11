@@ -1,6 +1,10 @@
+pub mod access;
 pub mod auth;
+pub mod folders;
 pub mod notes;
 pub mod schema;
+pub mod sharing;
+pub mod users;
 
 use crate::error::Error;
 use diesel::{
@@ -89,6 +93,8 @@ mod tests {
                         token_version: 0,
                         verified,
                         created_at,
+                        name: "Test user".into(),
+                        name_key: "test user".into(),
                     },
                 )
                 .unwrap();
@@ -109,6 +115,7 @@ mod tests {
                 )
                 .unwrap();
             }
+
             // Foreign-key enforcement is configured on every pooled connection.
             assert!(
                 diesel::insert_into(n::table)
@@ -163,5 +170,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn initial_schema_indexes_notes_and_preserves_them_on_reopen() {
+        use diesel_migrations::MigrationHarness;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.sqlite");
+        let url = path.to_str().unwrap();
+        {
+            let mut conn = SqliteConnection::establish(url).unwrap();
+            // Install the initial schema, then insert notes before reopening the database.
+            let migrations =
+                diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(
+                    &db::MIGRATIONS,
+                )
+                .unwrap();
+            diesel::migration::MigrationConnection::setup(&mut conn).unwrap();
+            assert_eq!(migrations.len(), 1);
+            conn.run_migrations(&migrations).unwrap();
+            conn.batch_execute("INSERT INTO users(id,email,password_hash,verified,created_at) VALUES ('owner','owner@test.test','hash',1,123);
+                INSERT INTO notes(id,user_id,title,body,created_at,updated_at) VALUES ('old','owner','Legacy title','legacy searchable content',123,456);").unwrap();
+        }
+        let pool = db::connect(url).unwrap();
+        let mut conn = pool.get().unwrap();
+        let note = db::notes::get(&mut conn, "owner", "old").unwrap();
+        assert_eq!(note.body, "legacy searchable content");
+        assert_eq!(note.created_at, 123);
+        assert_eq!(note.updated_at, 456);
+        assert_eq!(note.revision, 1);
+        assert_eq!(note.folder_id, None);
+        assert!(db::auth::user(&mut conn, "owner").unwrap().name.is_empty());
+        let found = db::notes::search(
+            &mut conn,
+            "owner",
+            "\"searchable\"*",
+            "title : \"searchable\"",
+            50,
+            0,
+        )
+        .unwrap();
+        assert_eq!(found[0].id, "old");
     }
 }

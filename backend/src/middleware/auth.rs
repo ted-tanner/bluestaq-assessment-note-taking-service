@@ -22,6 +22,7 @@ impl FromRequest for AuthenticatedUser {
             Ok(Self(UserInfo {
                 id: claims.user_id,
                 email: claims.email,
+                name: String::new(),
             }))
         })())
     }

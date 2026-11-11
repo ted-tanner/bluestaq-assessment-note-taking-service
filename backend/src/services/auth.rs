@@ -104,11 +104,23 @@ impl AuthService {
         Ok(pending.info)
     }
 
+    #[cfg(test)]
     pub async fn register(
         &self,
         email: String,
         password: Zeroizing<String>,
     ) -> Result<ChallengeInfo, Error> {
+        self.register_with_name(email, password, "Test user".into())
+            .await
+    }
+
+    pub async fn register_with_name(
+        &self,
+        email: String,
+        password: Zeroizing<String>,
+        name: String,
+    ) -> Result<ChallengeInfo, Error> {
+        let name = super::users::validate_name(name)?;
         let email = normalize_email(&email)?;
         validate_password(&password)?;
 
@@ -130,6 +142,8 @@ impl AuthService {
                     token_version: 0,
                     verified: false,
                     created_at: crypto::now(),
+                    name_key: name.to_lowercase(),
+                    name,
                 };
                 dao::insert_user(conn, &user)?;
 
@@ -338,6 +352,58 @@ impl AuthService {
                 None,
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    pub async fn change_password(
+        &self,
+        access_token: String,
+        current_password: Zeroizing<String>,
+        new_password: Zeroizing<String>,
+    ) -> Result<SignInResult, Error> {
+        let claims = crypto::verify(&self.config, &access_token, crypto::TokenType::Access)?;
+        validate_password(&new_password)?;
+        if current_password.len() > 1024 {
+            return Err(Error::Unauthorized);
+        }
+        let user_id = claims.user_id.clone();
+        let user = db::run(self.pool.clone(), move |conn| {
+            dao::user(conn, &user_id).map_err(|error| match error {
+                diesel::result::Error::NotFound => Error::Unauthorized,
+                _ => error.into(),
+            })
+        })
+        .await?;
+        if !user.verified || user.token_version != claims.token_version {
+            return Err(Error::Unauthorized);
+        }
+        let stored_hash = user.password_hash.clone();
+        let new_hash = self
+            .crypto(move |config| {
+                if !crypto::verify_password(config, &current_password, &stored_hash)? {
+                    return Err(Error::Unauthorized);
+                }
+                crypto::hash_password(config, &new_password)
+            })
+            .await?;
+        let config = self.config.clone();
+        db::run(self.pool.clone(), move |conn| {
+            conn.immediate_transaction::<_, Error, _>(|conn| {
+                let current = dao::user(conn, &user.id)?;
+                // Verification ran outside the transaction; reject concurrent changes or resets.
+                if !current.verified
+                    || current.password_hash != user.password_hash
+                    || current.token_version != claims.token_version
+                {
+                    return Err(Error::Unauthorized);
+                }
+                dao::update_password(conn, &user.id, &new_hash)?;
+                dao::delete_user_challenges(conn, &user.id)?;
+                let updated = dao::user(conn, &user.id)?;
+                // Keep token generation inside the transaction so failures roll back the change.
+                issue_tokens(&config, updated, claims.authenticated_at)
+            })
         })
         .await
     }
@@ -810,6 +876,7 @@ mod tests {
         );
         assert_eq!(b::table.count().get_result::<i64>(&mut conn).unwrap(), 1);
     }
+
     #[actix_web::test]
     async fn stale_token_version_is_rechecked_before_blacklist_insertion() {
         let database = crate::test_utils::TestDb::new();
@@ -826,6 +893,8 @@ mod tests {
                 token_version: 1,
                 verified: true,
                 created_at: now,
+                name: "Test user".into(),
+                name_key: "test user".into(),
             },
         )
         .unwrap();
@@ -857,6 +926,7 @@ mod tests {
         );
         assert_eq!(b::table.count().get_result::<i64>(&mut conn).unwrap(), 1);
     }
+
     #[actix_web::test]
     async fn registration_normalizes_email_and_requires_verification() {
         let fixture = crate::test_utils::Fixture::new().await;
@@ -1142,6 +1212,215 @@ mod tests {
             .await
             .unwrap();
         auth.refresh(other.refresh_token).await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn password_change_preserves_deadline_and_revokes_old_sessions_and_challenges() {
+        let fixture = crate::test_utils::Fixture::new().await;
+        let session = fixture.register("change@example.test").await;
+        let auth = &fixture.services.auth;
+        let challenge = auth
+            .request_reset("change@example.test".into())
+            .await
+            .unwrap();
+        let code = fixture.code().await;
+        let original = crypto::verify(
+            &auth.config,
+            &session.access_token,
+            crypto::TokenType::Access,
+        )
+        .unwrap();
+        // A login well before today makes resetting authenticated_at detectable.
+        let access = crypto::issue_token(
+            &auth.config,
+            &session.user,
+            0,
+            original.authenticated_at - crypto::SESSION_SECONDS + 600,
+            crypto::TokenType::Access,
+        )
+        .unwrap();
+        let changed = "a different change password";
+        let result = auth
+            .change_password(
+                access.value,
+                crate::test_utils::PASSWORD.to_string().into(),
+                changed.to_string().into(),
+            )
+            .await
+            .unwrap();
+        let claims = crypto::verify(
+            &auth.config,
+            &result.refresh_token,
+            crypto::TokenType::Refresh,
+        )
+        .unwrap();
+        assert_eq!(
+            claims.authenticated_at,
+            original.authenticated_at - crypto::SESSION_SECONDS + 600
+        );
+        assert_eq!(
+            claims.expiration,
+            claims.authenticated_at + crypto::SESSION_SECONDS
+        );
+        assert_eq!(claims.token_version, 1);
+        assert!(matches!(
+            auth.refresh(session.refresh_token).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            auth.confirm_reset(
+                challenge.challenge_id,
+                code.into(),
+                "another reset password".to_string().into()
+            )
+            .await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            auth.sign_in(
+                "change@example.test".into(),
+                crate::test_utils::PASSWORD.to_string().into()
+            )
+            .await,
+            Err(Error::Unauthorized)
+        ));
+        auth.sign_in("change@example.test".into(), changed.to_string().into())
+            .await
+            .unwrap();
+        auth.refresh(result.refresh_token).await.unwrap();
+        // Copied access tokens retain the existing short-lived validity contract.
+        crypto::verify(
+            &auth.config,
+            &session.access_token,
+            crypto::TokenType::Access,
+        )
+        .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn password_change_failures_leave_credentials_unchanged() {
+        let fixture = crate::test_utils::Fixture::new().await;
+        let session = fixture.register("change@example.test").await;
+        let auth = &fixture.services.auth;
+        for invalid in ["short".to_owned(), "x".repeat(1025)] {
+            assert!(matches!(
+                auth.change_password(
+                    session.access_token.clone(),
+                    crate::test_utils::PASSWORD.to_string().into(),
+                    invalid.into()
+                )
+                .await,
+                Err(Error::BadRequest(_))
+            ));
+        }
+        for invalid in ["wrong".to_owned(), "x".repeat(1025)] {
+            assert!(matches!(
+                auth.change_password(
+                    session.access_token.clone(),
+                    invalid.into(),
+                    "a valid new password".to_string().into()
+                )
+                .await,
+                Err(Error::Unauthorized)
+            ));
+        }
+        let _permit = auth
+            .hashing
+            .clone()
+            .acquire_many_owned(auth.config.hash_concurrency as u32)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.change_password(
+                session.access_token.clone(),
+                crate::test_utils::PASSWORD.to_string().into(),
+                "a valid new password".to_string().into()
+            )
+            .await,
+            Err(Error::RateLimited)
+        ));
+        drop(_permit);
+        let before = dao::user(&mut auth.pool.get().unwrap(), &session.user.id).unwrap();
+        let mut failing = auth.clone();
+        failing.config = Arc::new(Config {
+            refresh_token_lifetime_secs: i64::MAX,
+            ..(*auth.config).clone()
+        });
+        assert!(matches!(
+            failing
+                .change_password(
+                    session.access_token.clone(),
+                    crate::test_utils::PASSWORD.to_string().into(),
+                    "a valid new password".to_string().into()
+                )
+                .await,
+            Err(Error::Internal)
+        ));
+        let after = dao::user(&mut auth.pool.get().unwrap(), &session.user.id).unwrap();
+        assert_eq!(before.password_hash, after.password_hash);
+        assert_eq!(before.token_version, after.token_version);
+        // Reusing the current password is supported.
+        auth.change_password(
+            session.access_token,
+            crate::test_utils::PASSWORD.to_string().into(),
+            crate::test_utils::PASSWORD.to_string().into(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn competing_password_changes_and_resets_cannot_overwrite_each_other() {
+        let fixture = crate::test_utils::Fixture::new().await;
+        let session = fixture.register("change@example.test").await;
+        let auth = &fixture.services.auth;
+        let (first, second) = tokio::join!(
+            auth.change_password(
+                session.access_token.clone(),
+                crate::test_utils::PASSWORD.to_string().into(),
+                "first changed password".to_string().into()
+            ),
+            auth.change_password(
+                session.access_token,
+                crate::test_utils::PASSWORD.to_string().into(),
+                "second changed password".to_string().into()
+            )
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let winner = first.or(second).unwrap();
+        let password = if auth
+            .sign_in(
+                "change@example.test".into(),
+                "first changed password".to_string().into(),
+            )
+            .await
+            .is_ok()
+        {
+            "first changed password"
+        } else {
+            "second changed password"
+        };
+        fixture.sender.take_messages().await;
+        let challenge = auth
+            .request_reset("change@example.test".into())
+            .await
+            .unwrap();
+        let code = fixture.code().await;
+        let (change, reset) = tokio::join!(
+            auth.change_password(
+                winner.access_token,
+                password.to_string().into(),
+                "third changed password".to_string().into()
+            ),
+            auth.confirm_reset(
+                challenge.challenge_id,
+                code.into(),
+                "reset changed password".to_string().into()
+            )
+        );
+        assert_ne!(change.is_ok(), reset.is_ok());
+        let stored = dao::user(&mut auth.pool.get().unwrap(), &winner.user.id).unwrap();
+        assert_eq!(stored.token_version, 2);
     }
 
     #[actix_web::test]

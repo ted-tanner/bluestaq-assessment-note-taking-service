@@ -15,6 +15,14 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
+pub struct Registration {
+    pub email: String,
+    pub password: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub email: String,
     pub password: String,
@@ -47,6 +55,36 @@ pub struct Reset {
     pub new_password: String,
 }
 
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordChange {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub async fn change_password(
+    _csrf: Csrf<CsrfHeader>,
+    req: HttpRequest,
+    services: web::Data<AppServices>,
+    body: web::Json<PasswordChange>,
+) -> Result<HttpResponse, Error> {
+    let token = req
+        .cookie("access_token")
+        .ok_or(Error::Unauthorized)?
+        .value()
+        .to_owned();
+    let mut body = body.into_inner();
+    let result = services
+        .auth
+        .change_password(
+            token,
+            Zeroizing::new(std::mem::take(&mut body.current_password)),
+            Zeroizing::new(std::mem::take(&mut body.new_password)),
+        )
+        .await?;
+    Ok(sign_in_response(&services, result))
+}
+
 fn sign_in_response(services: &AppServices, result: SignInResult) -> HttpResponse {
     HttpResponse::Ok()
         .cookie(token_cookie(
@@ -72,14 +110,15 @@ pub async fn csrf(_token: CsrfToken) -> HttpResponse {
 pub async fn register(
     _csrf: Csrf<CsrfHeader>,
     services: web::Data<AppServices>,
-    body: web::Json<Credentials>,
+    body: web::Json<Registration>,
 ) -> Result<HttpResponse, Error> {
     let mut body = body.into_inner();
     let info = services
         .auth
-        .register(
+        .register_with_name(
             std::mem::take(&mut body.email),
             Zeroizing::new(std::mem::take(&mut body.password)),
+            std::mem::take(&mut body.name),
         )
         .await?;
 
@@ -233,8 +272,11 @@ fn clear_session(services: &AppServices) -> HttpResponse {
     response.finish()
 }
 
-pub async fn me(user: AuthenticatedUser) -> HttpResponse {
-    HttpResponse::Ok().json(user.0)
+pub async fn me(
+    user: AuthenticatedUser,
+    services: web::Data<AppServices>,
+) -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(services.users.get(user.0.id).await?))
 }
 
 #[cfg(test)]
@@ -815,9 +857,20 @@ mod tests {
         assert_eq!(access.expiration - access.issued_at, 60);
         assert_eq!(refresh.expiration - refresh.issued_at, 3600);
 
-        let no_db =
-            test::init_service(App::new().configure(|cfg| routes::configure(cfg, &config))).await;
-        let result = request!(no_db, jar, Method::GET, "/api/user/me", json!({}));
+        let no_db = test::init_service(
+            App::new()
+                .configure(|cfg| routes::configure(cfg, &config))
+                .route(
+                    "/identity",
+                    web::get().to(
+                        |user: crate::middleware::auth::AuthenticatedUser| async move {
+                            actix_web::HttpResponse::Ok().json(user.0)
+                        },
+                    ),
+                ),
+        )
+        .await;
+        let result = request!(no_db, jar, Method::GET, "/identity", json!({}));
         assert_eq!(result.status, StatusCode::OK);
         assert!(result.cookies.is_empty());
 
@@ -825,6 +878,7 @@ mod tests {
         let user = crate::models::user::UserInfo {
             id: access.user_id,
             email: access.email,
+            name: String::new(),
         };
         let authenticated_at = now - crypto::SESSION_SECONDS + 30;
         let near_deadline = crypto::issue_token(
@@ -862,6 +916,104 @@ mod tests {
         assert_eq!(
             request!(app, jar, Method::POST, "/api/auth/refresh", json!({})).status,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[actix_web::test]
+    async fn password_change_rotates_cookies_and_revokes_other_browsers_across_instances() {
+        let fixture = Fixture::new().await;
+        let config = &fixture.services.auth.config;
+        let app = app!(fixture);
+        let mut jar = Jar::new();
+        signup!(app, jar, fixture, "change@example.test");
+        let mut other = jar.clone();
+        let original_csrf = jar[config.csrf_cookie_name()].clone();
+        let original_access = jar["access_token"].clone();
+        let payload = json!({"current_password":PASSWORD,"new_password":"a new browser password"});
+        let mut anonymous = jar.clone();
+        anonymous.remove("access_token");
+        assert_eq!(
+            request!(
+                app,
+                anonymous,
+                Method::POST,
+                "/api/auth/password-change",
+                payload.clone()
+            )
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut missing_csrf = jar.clone();
+        missing_csrf.remove(config.csrf_cookie_name());
+        assert_eq!(
+            request!(
+                app,
+                missing_csrf,
+                Method::POST,
+                "/api/auth/password-change",
+                payload.clone()
+            )
+            .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let wrong = request!(
+            app,
+            jar,
+            Method::POST,
+            "/api/auth/password-change",
+            json!({"current_password":"wrong","new_password":"a new browser password"})
+        );
+        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+        assert!(wrong.cookies.is_empty());
+        let response = request!(app, jar, Method::POST, "/api/auth/password-change", payload);
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body["user"]["email"], "change@example.test");
+        assert_session_cookies(&response, config);
+        assert_eq!(jar[config.csrf_cookie_name()], original_csrf);
+        assert_ne!(jar["access_token"], original_access);
+        assert_eq!(
+            request!(app, jar, Method::GET, "/api/user/me", json!({})).status,
+            StatusCode::OK
+        );
+        let restarted = test::init_service(
+            App::new()
+                .app_data(web::Data::new(
+                    AppServices::new(
+                        fixture.database.reopen(),
+                        config.clone(),
+                        fixture.sender.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                ))
+                .configure(|cfg| routes::configure(cfg, config)),
+        )
+        .await;
+        assert_eq!(
+            request!(
+                restarted,
+                other,
+                Method::POST,
+                "/api/auth/refresh",
+                json!({})
+            )
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request!(restarted, jar, Method::POST, "/api/auth/refresh", json!({})).status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request!(
+                restarted,
+                jar,
+                Method::POST,
+                "/api/notes",
+                json!({"title":"Still signed in"})
+            )
+            .status,
+            StatusCode::CREATED
         );
     }
 
@@ -1001,6 +1153,7 @@ mod tests {
             1
         );
     }
+
     fn assert_session_cookies(
         response: &crate::test_utils::Response,
         config: &crate::config::Config,
@@ -1218,6 +1371,11 @@ mod tests {
                 "/api/auth/password-reset/request",
                 json!({"email":"user@example.test"}),
                 "email",
+            ),
+            (
+                "/api/auth/password-change",
+                json!({"current_password":PASSWORD, "new_password":PASSWORD}),
+                "current_password",
             ),
             (
                 "/api/auth/password-reset/confirm",

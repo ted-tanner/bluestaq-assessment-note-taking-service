@@ -1,7 +1,8 @@
-<svelte:head>
-	<title>Bluestaq Notes</title>
-	<meta name="description" content="Bluestaq Notes — a note-taking application." />
-</svelte:head>
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
+  import { session } from "#lib/session.svelte.js";
+  onMount(() => goto(session.user ? "/notes" : "/sign-in", { replace: true }));
+</script>
 
-<h1>Bluestaq Notes</h1>
-<p>Your notes start here.</p>
+<p class="boot-message" role="status">Opening your workspace…</p>

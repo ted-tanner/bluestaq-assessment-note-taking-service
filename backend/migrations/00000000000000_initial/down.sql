@@ -1,4 +1,11 @@
+DROP TABLE note_shares;
+DROP TABLE folder_shares;
+DROP TRIGGER notes_search_update;
+DROP TRIGGER notes_search_delete;
+DROP TRIGGER notes_search_insert;
+DROP TABLE notes_fts;
 DROP TABLE token_blacklist;
 DROP TABLE notes;
+DROP TABLE folders;
 DROP TABLE email_challenges;
 DROP TABLE users;

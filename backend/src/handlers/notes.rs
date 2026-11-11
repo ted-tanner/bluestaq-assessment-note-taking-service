@@ -3,11 +3,11 @@ use crate::{
     middleware::auth::AuthenticatedUser,
     services::{
         AppServices,
-        notes::{NewNote, NotePatch, Pagination},
+        notes::{NewNote, NotePatch, Pagination, SearchQuery},
     },
 };
 use actix_csrf::extractor::{Csrf, CsrfHeader};
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, web};
 use uuid::Uuid;
 
 pub async fn create(
@@ -16,11 +16,15 @@ pub async fn create(
     services: web::Data<AppServices>,
     input: web::Json<NewNote>,
 ) -> Result<HttpResponse, Error> {
-    let note = services.notes.create(user.0.id, input.into_inner()).await?;
+    let note = services
+        .notes
+        .create(user.0.id.clone(), input.into_inner())
+        .await?;
 
     Ok(HttpResponse::Created()
         .append_header(("Location", format!("/api/notes/{}", note.id)))
-        .json(note))
+        .append_header(("ETag", format!("\"{}\"", note.revision)))
+        .json(services.sharing.present_note(user.0.id, note).await?))
 }
 
 pub async fn list(
@@ -28,7 +32,11 @@ pub async fn list(
     services: web::Data<AppServices>,
     page: web::Query<Pagination>,
 ) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(services.notes.list(user.0.id, page.into_inner()).await?))
+    let notes = services
+        .notes
+        .list(user.0.id.clone(), page.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(services.sharing.present_notes(user.0.id, notes).await?))
 }
 
 pub async fn get(
@@ -36,33 +44,81 @@ pub async fn get(
     services: web::Data<AppServices>,
     id: web::Path<Uuid>,
 ) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(services.notes.get(user.0.id, id.to_string()).await?))
+    let note = services
+        .notes
+        .get(user.0.id.clone(), id.to_string())
+        .await?;
+    Ok(HttpResponse::Ok()
+        .append_header(("ETag", format!("\"{}\"", note.revision)))
+        .json(services.sharing.present_note(user.0.id, note).await?))
 }
 
 pub async fn update(
+    req: HttpRequest,
     _csrf: Csrf<CsrfHeader>,
     user: AuthenticatedUser,
     services: web::Data<AppServices>,
     id: web::Path<Uuid>,
     input: web::Json<NotePatch>,
 ) -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(
-        services
-            .notes
-            .update(user.0.id, id.to_string(), input.into_inner())
-            .await?,
-    ))
+    let mut patch = input.into_inner();
+    patch.expected_revision = revision(&req)?;
+    let note = services
+        .notes
+        .update(user.0.id.clone(), id.to_string(), patch)
+        .await?;
+    Ok(HttpResponse::Ok()
+        .append_header(("ETag", format!("\"{}\"", note.revision)))
+        .json(services.sharing.present_note(user.0.id, note).await?))
 }
 
 pub async fn delete(
+    req: HttpRequest,
     _csrf: Csrf<CsrfHeader>,
     user: AuthenticatedUser,
     services: web::Data<AppServices>,
     id: web::Path<Uuid>,
 ) -> Result<HttpResponse, Error> {
-    services.notes.delete(user.0.id, id.to_string()).await?;
+    services
+        .notes
+        .delete(user.0.id, id.to_string(), revision(&req)?)
+        .await?;
 
     Ok(HttpResponse::NoContent().finish())
+}
+
+pub(crate) fn revision(req: &HttpRequest) -> Result<i64, Error> {
+    let value = req
+        .headers()
+        .get("If-Match")
+        .ok_or(Error::PreconditionRequired)?;
+    let revision = value
+        .to_str()
+        .ok()
+        .and_then(|v| v.strip_prefix('"'))
+        .and_then(|v| v.strip_suffix('"'))
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0);
+    revision.ok_or(Error::BadRequest(
+        "If-Match must contain one quoted positive revision",
+    ))
+}
+
+pub async fn search(
+    user: AuthenticatedUser,
+    services: web::Data<AppServices>,
+    query: web::Query<SearchQuery>,
+) -> Result<HttpResponse, Error> {
+    let result = services
+        .notes
+        .search(user.0.id.clone(), query.into_inner())
+        .await?;
+    let items = services
+        .sharing
+        .present_notes(user.0.id, result.items)
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({"items":items,"has_more":result.has_more})))
 }
 
 #[cfg(test)]
@@ -92,7 +148,8 @@ mod tests {
             alice,
             Method::PATCH,
             &format!("/api/notes/{id}"),
-            json!({"body": "updated"})
+            json!({"body": "updated"}),
+            "\"1\""
         );
         assert_eq!(response.body["title"], "First");
         assert_eq!(response.body["body"], "updated");
@@ -114,7 +171,8 @@ mod tests {
                 alice,
                 Method::DELETE,
                 &format!("/api/notes/{id}"),
-                json!({})
+                json!({}),
+                "\"2\""
             )
             .status,
             StatusCode::NO_CONTENT
@@ -179,7 +237,8 @@ mod tests {
                 alice,
                 Method::PATCH,
                 &format!("/api/notes/{id}"),
-                json!({})
+                json!({}),
+                "\"1\""
             )
             .status,
             StatusCode::BAD_REQUEST
@@ -218,7 +277,8 @@ mod tests {
                 bob,
                 method,
                 &format!("/api/notes/{id}"),
-                json!({"title":"stolen"})
+                json!({"title":"stolen"}),
+                "\"1\""
             );
             assert_eq!(response.status, StatusCode::NOT_FOUND);
         }
@@ -235,6 +295,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
     }
+
     #[actix_web::test]
     async fn create_sets_location_and_extractors_reject_malformed_requests() {
         let fixture = Fixture::new().await;
@@ -301,6 +362,7 @@ mod tests {
             );
         }
     }
+
     #[actix_web::test]
     async fn every_protected_endpoint_requires_authentication_with_valid_csrf() {
         let fixture = Fixture::new().await;
@@ -313,6 +375,7 @@ mod tests {
                 crate::services::notes::NewNote {
                     title: "private".into(),
                     body: "original".into(),
+                    folder_id: None,
                 },
             )
             .await
@@ -346,6 +409,8 @@ mod tests {
                 crate::services::notes::Pagination {
                     limit: 50,
                     offset: 0,
+                    folder_id: None,
+                    include_descendants: false,
                 },
             )
             .await
@@ -354,5 +419,65 @@ mod tests {
         assert_eq!(notes[0].id, note.id);
         assert_eq!(notes[0].title, "private");
         assert_eq!(notes[0].body, "original");
+    }
+
+    #[actix_web::test]
+    async fn revisions_and_etags_enforce_the_http_contract() {
+        let fixture = Fixture::new().await;
+        let app = app!(fixture);
+        let mut jar = Jar::new();
+        signup!(app, jar, fixture, "owner@example.test");
+        let created = request!(
+            app,
+            jar,
+            Method::POST,
+            "/api/notes",
+            json!({"title":"test"})
+        );
+        let path = format!("/api/notes/{}", created.body["id"].as_str().unwrap());
+        let req = crate::test_utils::request_builder(&jar, Method::GET, &path, &json!({}));
+        let response = actix_web::test::call_service(&app, req.to_request()).await;
+        assert_eq!(response.headers().get("ETag").unwrap(), "\"1\"");
+        for method in [Method::PATCH, Method::DELETE] {
+            assert_eq!(
+                request!(app, jar, method.clone(), &path, json!({"title":"change"})).status,
+                StatusCode::PRECONDITION_REQUIRED
+            );
+            for value in ["1", "*", "W/\"1\"", "\"0\"", "\"1\", \"2\""] {
+                assert_eq!(
+                    request!(
+                        app,
+                        jar,
+                        method.clone(),
+                        &path,
+                        json!({"title":"change"}),
+                        value
+                    )
+                    .status,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            assert_eq!(
+                request!(app, jar, method, &path, json!({"title":"change"}), "\"9\"").status,
+                StatusCode::PRECONDITION_FAILED
+            );
+        }
+        let changed = request!(
+            app,
+            jar,
+            Method::PATCH,
+            &path,
+            json!({"body":"saved"}),
+            "\"1\""
+        );
+        assert_eq!(changed.status, StatusCode::OK);
+        assert_eq!(changed.body["revision"], 2);
+        assert_eq!(
+            request!(app, jar, Method::DELETE, &path, json!({}), "\"1\"").status,
+            StatusCode::PRECONDITION_FAILED
+        );
+        let search = request!(app, jar, Method::GET, "/api/notes/search?q=sav", json!({}));
+        assert_eq!(search.status, StatusCode::OK);
+        assert_eq!(search.body["items"][0]["id"], created.body["id"]);
     }
 }

@@ -62,6 +62,8 @@ impl TestDb {
                 token_version: 0,
                 verified: true,
                 created_at: crypto::now(),
+                name: "Test user".into(),
+                name_key: "test user".into(),
             },
         )
         .unwrap();
@@ -142,10 +144,23 @@ pub struct Response {
 }
 
 pub fn request_builder(jar: &Jar, method: Method, path: &str, body: &Value) -> test::TestRequest {
+    let mut body = body.clone();
+    // Existing authentication fixtures register a named test user. Contract tests
+    // can override set_json to exercise a missing registration name explicitly.
+    if method == Method::POST
+        && path == "/api/auth/register"
+        && let Some(object) = body.as_object_mut()
+        && object.contains_key("email")
+        && object.contains_key("password")
+    {
+        object
+            .entry("name")
+            .or_insert_with(|| Value::String("Test user".into()));
+    }
     let mut req = test::TestRequest::default()
         .method(method)
         .uri(path)
-        .set_json(body);
+        .set_json(&body);
     for (name, value) in jar {
         req = req.cookie(Cookie::new(name.clone(), value.clone()));
     }
@@ -197,6 +212,12 @@ where
 
 // Keep Actix's opaque application/request types inferred at the call site.
 macro_rules! request {
+    ($app:expr, $jar:expr, $method:expr, $path:expr, $body:expr, $revision:expr) => {{
+        let req = $crate::test_utils::request_builder(&$jar, $method, $path, &$body)
+            .insert_header(("If-Match", $revision));
+        let response = actix_web::test::call_service(&$app, req.to_request()).await;
+        $crate::test_utils::read_response(response, &mut $jar).await
+    }};
     ($app:expr, $jar:expr, $method:expr, $path:expr, $body:expr) => {{
         let req = $crate::test_utils::request_builder(&$jar, $method, $path, &$body);
         let response = actix_web::test::call_service(&$app, req.to_request()).await;

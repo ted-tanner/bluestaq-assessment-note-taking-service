@@ -8,6 +8,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::post().to(notes::create))
             .route(web::get().to(notes::list)),
     )
+    .service(web::resource("/notes/search").route(web::get().to(notes::search)))
     .service(
         web::resource("/notes/{id}")
             .route(web::get().to(notes::get))

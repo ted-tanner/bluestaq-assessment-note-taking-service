@@ -12,4 +12,6 @@ pub struct Note {
     pub body: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
+    pub folder_id: Option<String>,
 }

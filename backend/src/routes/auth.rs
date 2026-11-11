@@ -16,6 +16,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/email/resend", web::post().to(auth::resend))
             .route("/refresh", web::post().to(auth::refresh))
             .route("/logout", web::post().to(auth::logout))
+            .route("/password-change", web::post().to(auth::change_password))
             .route(
                 "/password-reset/request",
                 web::post().to(auth::reset_request),

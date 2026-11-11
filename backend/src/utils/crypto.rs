@@ -316,6 +316,7 @@ mod tests {
         drop(permit);
         assert_eq!(run(|| Ok(42)).await.unwrap(), 42);
     }
+
     #[actix_web::test]
     async fn password_hashes_use_salts_and_require_the_configured_pepper() {
         let config = crate::test_utils::config();

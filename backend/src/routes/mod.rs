@@ -1,4 +1,5 @@
 mod auth;
+pub mod folders;
 mod health;
 mod notes;
 mod user;
@@ -30,6 +31,8 @@ pub fn configure(cfg: &mut web::ServiceConfig, config: &Config) {
                 .configure(auth::configure)
                 .configure(health::configure)
                 .configure(notes::configure)
+                .configure(folders::configure)
+                .configure(crate::handlers::sharing::configure)
                 .configure(user::configure),
         );
 }
@@ -189,6 +192,9 @@ mod tests {
         let fixture = Fixture::new().await;
         let app = app!(fixture);
         let note = format!("/api/notes/{}", uuid::Uuid::new_v4());
+        let folder = format!("/api/folders/{}", uuid::Uuid::new_v4());
+        let note_share = format!("{note}/shares/{}", uuid::Uuid::new_v4());
+        let folder_share = format!("{folder}/shares/{}", uuid::Uuid::new_v4());
 
         for (method, path) in [
             (Method::POST, "/api/auth/register"),
@@ -198,11 +204,20 @@ mod tests {
             (Method::POST, "/api/auth/email/resend"),
             (Method::POST, "/api/auth/refresh"),
             (Method::POST, "/api/auth/logout"),
+            (Method::POST, "/api/auth/password-change"),
             (Method::POST, "/api/auth/password-reset/request"),
             (Method::POST, "/api/auth/password-reset/confirm"),
             (Method::POST, "/api/notes"),
             (Method::PATCH, note.as_str()),
             (Method::DELETE, note.as_str()),
+            (Method::POST, "/api/folders"),
+            (Method::PATCH, "/api/user/me"),
+            (Method::PUT, note_share.as_str()),
+            (Method::DELETE, note_share.as_str()),
+            (Method::PUT, folder_share.as_str()),
+            (Method::DELETE, folder_share.as_str()),
+            (Method::PATCH, folder.as_str()),
+            (Method::DELETE, folder.as_str()),
         ] {
             let response = test::call_service(
                 &app,
@@ -227,7 +242,9 @@ mod tests {
         let app = app!(fixture);
         let mut jar = Jar::new();
         request!(app, jar, Method::GET, "/api/auth/csrf-token", json!({}));
-        let mut payload = serde_json::to_string(&json!({"email":"", "password":PASSWORD})).unwrap();
+        let mut payload =
+            serde_json::to_string(&json!({"email":"", "password":PASSWORD, "name":"Test user"}))
+                .unwrap();
         let empty_email = payload.find("\"email\":\"\"").unwrap() + "\"email\":\"".len();
         payload.insert_str(empty_email, &"x".repeat(4 * 1024 * 1024 - payload.len()));
         assert_eq!(payload.len(), 4 * 1024 * 1024);

@@ -7,3 +7,7 @@ node_modules/
 /backend/*.sqlite-*
 /backend/*.db
 /backend/*.db-*
+
+.pnpm-store/
+/frontend/test-results/
+/frontend/playwright-report/
