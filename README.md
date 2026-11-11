@@ -5,18 +5,19 @@
 
 ## Backend
 
-Install Rust with Cargo, then run:
+See [backend/README.md](backend/README.md) for environment setup, authentication flows, and API examples. After configuring `backend/.env`, run:
 
 ```sh
 cd backend
 cargo run
 ```
 
-The backend currently prints a welcome message. To check it:
+To check the backend:
 
 ```sh
-cargo check
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
 ## Frontend
