@@ -23,9 +23,11 @@ I used AI (Codex) extensively to help me build this in the short time allotted, 
 
 The challenge was described as a note-taking service "used and shared amongst several small teams." Given that small scope, I chose to keep things simple and store notes into a relational database. For ease of running the prototype, I used sqlite, though I'd usually recommend Postgres so the application server can scale horizontally behind a load balancer, if needed. If the scale were to grow, I'd consider not storing all of the notes in the DB (DB storage is expensive!) and move them over to blob storage. However, best to keep things simple until something less simple is needed.
 
-The t
+I'm very experienced building authentication/authorization systems and am aware of the security pitfalls, so it seemed quicker and easier to me to build out a simple, custom JWT scheme than to use an existing service. This works well for this app and scope, but often auth has more requirements than this app does (e.g. granular permission sets, federated auth). In that case, an off-the-shelf solution may be the right way to go if the team doesn't want the burden of maintaining auth.
 
 ## Frontend design choices and compromises
+
+The frontend needs some loving. Whereas I scrutinized backend code, I essentially just vibe coded the front end. There are still some rough edges in the UI that I didn't get the time to polish and I would provide better organization for the code if I had more time.
 
 ## Future functionality
 
@@ -44,6 +46,8 @@ I thought through some functionality that I could add to make this a better prod
   - Access management for groups and individuals
 
 ## What I'd change about how I approached this
+
+I didn't leave enough time for a final validation/polish phase. I would love to provide a more polished prototype, so I should have given myself more time for that final phase. I should have been a little less particular with making the backend perfect and devoted more time to the frontend.
 
 ## How to run
 
